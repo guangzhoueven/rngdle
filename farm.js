@@ -5,6 +5,7 @@ const path = require('path');
 const SITE = 'https://rngdle.com';
 const OUT_DIR = path.join(__dirname, 'output');
 const MYTHIC_MIN_SCORE = 162292; // first score whose percentile >= 99 (Top 1%)
+const TARGET = Math.max(1, Number(process.env.TARGET) || 10); // how many Top 1% rolls to collect
 const WORKERS = Math.max(1, Number(process.env.WORKERS) || 4);
 const MAX_MINUTES = Math.max(1, Number(process.env.MAX_MINUTES) || 30);
 const HEADLESS = process.env.HEADLESS !== '0';
@@ -53,6 +54,7 @@ function badgeTier(score) {
 const TIER_EMOJI = { TRASH: '🟫', COMMON: '⬜', UNCOMMON: '🟩', RARE: '🟦', EPIC: '🟪', ANOMALY: '🟧', MYTHIC: '🟥' };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const fmt = n => n.toLocaleString('en-US');
+const pad2 = n => String(n).padStart(2, '0');
 
 function log(msg) { console.log(msg); }
 
@@ -85,45 +87,6 @@ async function gotoWithRetry(page, tries = 4) {
   throw lastErr;
 }
 
-async function runWorker(browser, id, state) {
-  let context = null;
-  try {
-    await sleep((id - 1) * 500);
-    context = await browser.newContext({ viewport: { width: 1280, height: 860 } });
-    const page = await context.newPage();
-    page.setDefaultTimeout(45000);
-    await gotoWithRetry(page);
-    while (!state.winner && Date.now() < state.deadline) {
-      try {
-        const roll = await rollOnce(page);
-        state.attempts++;
-        const pct = percentileFor(roll.totalScore);
-        const tier = cardTier(pct);
-        log(`[w${id}] #${String(state.attempts).padStart(4)} roll=${String(roll.number).padStart(6)} EP=${fmt(roll.totalScore).padStart(9)} pct=${pct.toFixed(2).padStart(6)}% ${tier}`);
-        if (roll.totalScore >= MYTHIC_MIN_SCORE && pct >= 99) {
-          state.winner = { id, page, context, roll, pct, tier, attempt: state.attempts };
-          return;
-        }
-      } catch (err) {
-        state.errors++;
-        log(`[w${id}] error (${state.errors}): ${String(err.message).split('\n')[0]}`);
-        await sleep(1200);
-        try { await gotoWithRetry(page, 2); } catch (e2) {
-          log(`[w${id}] recovery failed: ${String(e2.message).split('\n')[0]}`);
-          break;
-        }
-      }
-    }
-  } catch (err) {
-    state.deadWorkers++;
-    log(`[w${id}] worker stopped: ${String(err.message).split('\n')[0]}`);
-  } finally {
-    if (context && (!state.winner || state.winner.id !== id)) {
-      try { await context.close(); } catch (_) {}
-    }
-  }
-}
-
 async function readTierRow(page) {
   return page.evaluate(() => {
     const bullet = [...document.querySelectorAll('span')].find(s => s.textContent.trim() === '•');
@@ -144,9 +107,72 @@ async function readLifetimeEp(page) {
   }).catch(() => null);
 }
 
-async function finalize(state, startedAt) {
-  const { page, roll, pct, tier } = state.winner;
-  log(`\nMYTHIC roll found at attempt #${state.winner.attempt}, waiting for page animation...`);
+function writeOutputs(state, startedAt) {
+  const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  const payload = {
+    site: SITE,
+    generatedAt: new Date().toISOString(),
+    target: state.target,
+    collected: state.mythics.length,
+    attempts: state.attempts,
+    workers: WORKERS,
+    errors: state.errors,
+    elapsedSeconds: elapsedSec,
+    rolls: state.mythics,
+  };
+  fs.writeFileSync(path.join(OUT_DIR, 'collection.json'), JSON.stringify(payload, null, 2), 'utf8');
+
+  const txt = [
+    `RNGdle Top 1% Collection — ${state.mythics.length}/${state.target}`,
+    '==================================================',
+    `Updated       : ${payload.generatedAt}`,
+    `Attempts      : ${state.attempts} (${WORKERS} workers, ${state.errors} errors)`,
+    `Elapsed       : ${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s`,
+    `Mythic rule   : EP >= ${fmt(MYTHIC_MIN_SCORE)} (percentile >= 99)`,
+    '',
+    'Collected rolls:',
+    '  #   Attempt    Number           EP  Percentile  Tier',
+    ...state.mythics.map(r =>
+      `  ${pad2(r.index)}  #${String(r.attempt).padStart(6)}  ${String(r.number).padStart(6)}  ${fmt(r.totalScore).padStart(12)}  ${r.percentile.toFixed(4).padStart(9)}  ${r.tierLabel || r.tier} ${r.percentileText || ''}`
+    ),
+    '',
+    'Screenshots:',
+    ...state.mythics.map(r => `  ${pad2(r.index)}. ${r.screenshot || '(capturing...)'}`),
+    '',
+    'Highlights:',
+    ...state.mythics.map(r =>
+      `  ${pad2(r.index)}. ${r.number} — ${(r.badges || []).slice(0, 3).map(b => `${b.emoji} ${b.label} +${fmt(b.score)}`).join(', ') || 'capturing...'}`
+    ),
+    '',
+    `JSON: ${path.join(OUT_DIR, 'collection.json')}`,
+  ].join('\n');
+  fs.writeFileSync(path.join(OUT_DIR, 'collection.txt'), txt, 'utf8');
+}
+
+async function recordMythic(state, startedAt, w) {
+  const index = state.mythics.length + 1;
+  const entry = {
+    index,
+    number: w.roll.number,
+    totalScore: w.roll.totalScore,
+    percentile: Number(w.pct.toFixed(4)),
+    tier: w.tier,
+    tierLabel: null,
+    percentileText: null,
+    worker: w.id,
+    attempt: w.attempt,
+    capturedAt: null,
+    lifetimeEp: null,
+    badgeCount: 0,
+    badges: [],
+    screenshot: null,
+    shareText: null,
+  };
+  state.mythics.push(entry); // reserve index synchronously before any await
+  log(`\n>>> MYTHIC ${index}/${state.target} at attempt #${w.attempt}: ${w.roll.number} (${fmt(w.roll.totalScore)} EP) — capturing...`);
+
+  const page = w.page;
   await page.waitForFunction(() => document.body.innerText.includes('MYTHIC'), null, { timeout: 90000 })
     .catch(() => log('warning: tier label did not appear within 90s'));
 
@@ -166,15 +192,10 @@ async function finalize(state, startedAt) {
   await page.setViewportSize({ width: 1280, height: 1700 });
   await sleep(600);
 
-  fs.mkdirSync(OUT_DIR, { recursive: true });
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const shotPath = path.join(OUT_DIR, 'top1.png');
-  const shotStamped = path.join(OUT_DIR, `top1_${stamp}.png`);
+  const shotPath = path.join(OUT_DIR, `mythic_${pad2(index)}.png`);
   await page.screenshot({ path: shotPath, fullPage: true });
-  fs.copyFileSync(shotPath, shotStamped);
 
-  const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
-  const badges = roll.badges.map(b => ({
+  const badges = w.roll.badges.map(b => ({
     emoji: b.emoji || '✨',
     label: b.label,
     rarity: badgeTier(b.score),
@@ -182,105 +203,112 @@ async function finalize(state, startedAt) {
     scoring: !!b.isScoring,
     description: b.description,
   }));
-
   const shareLines = [
-    `RNGdle 🎲 ${roll.number}`,
+    `RNGdle 🎲 ${w.roll.number}`,
     '',
-    `${TIER_EMOJI[tier]} ${tierRow?.tier || tier}${tierRow?.percentile ? ' • ' + tierRow.percentile : ''}`,
+    `${TIER_EMOJI[w.tier]} ${tierRow?.tier || w.tier}${tierRow?.percentile ? ' • ' + tierRow.percentile : ''}`,
     '',
     ...badges.slice(0, 3).map(b => `${TIER_EMOJI[b.rarity]} ${b.emoji} ${b.label}`),
     ...(badges.length > 3 ? [`+${badges.length - 3} more`] : []),
   ];
 
-  const info = {
-    site: SITE,
-    generatedAt: new Date().toISOString(),
-    attempts: state.attempts,
-    workers: WORKERS,
-    errors: state.errors,
-    elapsedSeconds: elapsedSec,
-    roll: {
-      number: roll.number,
-      totalScore: roll.totalScore,
-      percentile: Number(pct.toFixed(4)),
-      tier,
-      tierLabel: tierRow?.tier || tier,
-      percentileText: tierRow?.percentile || formatPercentile(pct),
-      lifetimeEp: lifetimeEp,
-      badgeCount: badges.length,
-      badges,
-    },
+  Object.assign(entry, {
+    tierLabel: tierRow?.tier || w.tier,
+    percentileText: tierRow?.percentile || formatPercentile(w.pct),
+    lifetimeEp,
+    badgeCount: badges.length,
+    badges,
     screenshot: shotPath,
-    screenshotStamped: shotStamped,
     shareText: shareLines.join('\n'),
-  };
-  fs.writeFileSync(path.join(OUT_DIR, 'result.json'), JSON.stringify(info, null, 2), 'utf8');
+    capturedAt: new Date().toISOString(),
+    elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
+    pageTextTop: domText.split('\n').slice(0, 30).join('\n'),
+  });
 
-  const txt = [
-    'RNGdle Top 1% Roll Report',
-    '=========================',
-    `Generated     : ${info.generatedAt}`,
-    `Site          : ${SITE}`,
-    `Attempts      : ${state.attempts} (${WORKERS} workers, ${state.errors} errors)`,
-    `Elapsed       : ${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s`,
-    '',
-    `Number        : ${roll.number}`,
-    `EP            : ${fmt(roll.totalScore)}`,
-    `Tier          : ${info.roll.tierLabel} (${info.roll.percentileText})`,
-    `Percentile    : ${pct}  (mythic threshold: score >= ${fmt(MYTHIC_MIN_SCORE)}, pct >= 99)`,
-    `Lifetime EP   : ${lifetimeEp || 'n/a'}`,
-    `Badges        : ${badges.length}`,
-    '',
-    'Badge breakdown:',
-    ...badges.map(b => `  [${b.rarity.padEnd(8)}] ${b.emoji} ${b.label}  +${fmt(b.score)} EP${b.scoring ? '' : ' (not scoring)'}${b.isNew ? '  (NEW)' : ''}`),
-    '',
-    'Share card:',
-    '-----------',
-    ...shareLines,
-    '-----------',
-    '',
-    `Screenshot    : ${shotPath}`,
-    `              ${shotStamped}`,
-    `JSON info     : ${path.join(OUT_DIR, 'result.json')}`,
-    '',
-    'Page text (top):',
-    '----------------',
-    ...domText.split('\n').slice(0, 40),
-  ].join('\n');
-  fs.writeFileSync(path.join(OUT_DIR, 'result.txt'), txt, 'utf8');
+  writeOutputs(state, startedAt);
+  log(`saved ${shotPath} — collected ${state.mythics.length}/${state.target}\n`);
+}
 
-  log(`\nDONE in ${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s after ${state.attempts} attempts`);
-  log(`Number ${roll.number} | ${fmt(roll.totalScore)} EP | ${info.roll.tierLabel} ${info.roll.percentileText}`);
-  log(`Saved: ${path.join(OUT_DIR, 'result.txt')}`);
-  log(`Saved: ${path.join(OUT_DIR, 'result.json')}`);
-  log(`Saved: ${shotPath}`);
+async function runWorker(browser, id, state, startedAt) {
+  let context = null;
+  try {
+    await sleep((id - 1) * 500);
+    context = await browser.newContext({ viewport: { width: 1280, height: 860 } });
+    const page = await context.newPage();
+    page.setDefaultTimeout(45000);
+    await gotoWithRetry(page);
+    while (state.mythics.length < state.target && Date.now() < state.deadline) {
+      try {
+        const roll = await rollOnce(page);
+        state.attempts++;
+        const pct = percentileFor(roll.totalScore);
+        const tier = cardTier(pct);
+        log(`[w${id}] #${String(state.attempts).padStart(4)} roll=${String(roll.number).padStart(6)} EP=${fmt(roll.totalScore).padStart(9)} pct=${pct.toFixed(2).padStart(6)}% ${tier}  [${state.mythics.length}/${state.target}]`);
+        if (roll.totalScore >= MYTHIC_MIN_SCORE && pct >= 99) {
+          await recordMythic(state, startedAt, { id, page, roll, pct, tier, attempt: state.attempts });
+        }
+      } catch (err) {
+        state.errors++;
+        log(`[w${id}] error (${state.errors}): ${String(err.message).split('\n')[0]}`);
+        await sleep(1200);
+        try { await gotoWithRetry(page, 2); } catch (e2) {
+          log(`[w${id}] recovery failed: ${String(e2.message).split('\n')[0]}`);
+          break;
+        }
+      }
+    }
+  } catch (err) {
+    state.deadWorkers++;
+    log(`[w${id}] worker stopped: ${String(err.message).split('\n')[0]}`);
+  } finally {
+    if (context) {
+      try { await context.close(); } catch (_) {}
+    }
+  }
+}
+
+function clearPreviousOutputs() {
+  try {
+    fs.mkdirSync(OUT_DIR, { recursive: true });
+    for (const f of fs.readdirSync(OUT_DIR)) {
+      if (/^mythic_\d+\.png$/.test(f) || f.startsWith('collection.') || f.startsWith('top1') || f.startsWith('result.')) {
+        fs.unlinkSync(path.join(OUT_DIR, f));
+      }
+    }
+  } catch (_) {}
 }
 
 (async () => {
   const startedAt = Date.now();
-  const state = { attempts: 0, errors: 0, deadWorkers: 0, winner: null, deadline: startedAt + MAX_MINUTES * 60000 };
-  log(`RNGdle farm | workers=${WORKERS} headless=${HEADLESS} limit=${MAX_MINUTES}m`);
-  log(`Goal: EP >= ${fmt(MYTHIC_MIN_SCORE)} (percentile >= 99 = MYTHIC = Top 1%)\n`);
+  const state = { attempts: 0, errors: 0, deadWorkers: 0, mythics: [], target: TARGET, deadline: startedAt + MAX_MINUTES * 60000 };
+  clearPreviousOutputs();
+  log(`RNGdle farm | target=${TARGET} mythics | workers=${WORKERS} headless=${HEADLESS} limit=${MAX_MINUTES}m`);
+  log(`Goal: collect ${TARGET} rolls with EP >= ${fmt(MYTHIC_MIN_SCORE)} (percentile >= 99 = MYTHIC = Top 1%)\n`);
 
   const browser = await chromium.launch({ headless: HEADLESS });
   try {
     await Promise.allSettled(
-      Array.from({ length: WORKERS }, (_, i) => runWorker(browser, i + 1, state))
+      Array.from({ length: WORKERS }, (_, i) => runWorker(browser, i + 1, state, startedAt))
     );
+    writeOutputs(state, startedAt);
 
-    if (state.winner) {
-      await finalize(state, startedAt);
+    const got = state.mythics.length;
+    const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+    if (got >= TARGET) {
+      log(`\nDONE: ${got}/${TARGET} Top 1% rolls in ${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s (${state.attempts} attempts, ${state.errors} errors)`);
+      for (const r of state.mythics) {
+        log(`  ${pad2(r.index)}. ${String(r.number).padStart(6)}  ${fmt(r.totalScore).padStart(9)} EP  ${r.tierLabel} ${r.percentileText}  -> ${path.basename(r.screenshot)}`);
+      }
+      log(`Saved: ${path.join(OUT_DIR, 'collection.txt')}`);
+      log(`Saved: ${path.join(OUT_DIR, 'collection.json')}`);
     } else if (state.deadWorkers >= WORKERS) {
-      log(`\nAll workers stopped after ${state.attempts} attempts (${state.errors} errors).`);
+      log(`\nAll workers stopped. Collected ${got}/${TARGET} after ${state.attempts} attempts (${state.errors} errors).`);
       process.exitCode = 1;
     } else {
-      log(`\nNo mythic roll within ${MAX_MINUTES} minutes (${state.attempts} attempts). Raise MAX_MINUTES or WORKERS.`);
+      log(`\nTimeout: collected ${got}/${TARGET} within ${MAX_MINUTES} minutes (${state.attempts} attempts). Raise MAX_MINUTES or WORKERS.`);
       process.exitCode = 1;
     }
   } finally {
-    if (state.winner) {
-      try { await state.winner.context.close(); } catch (_) {}
-    }
     await browser.close().catch(() => {});
   }
 })();
