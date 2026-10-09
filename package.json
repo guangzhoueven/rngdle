@@ -1,0 +1,17 @@
+{
+  "name": "rngdle-top1-farmer",
+  "version": "1.0.0",
+  "description": "Automate RNGdle re-rolls until a Mythic (Top 1%) roll, then save info + screenshot",
+  "scripts": {
+    "start": "node farm.js",
+    "farm": "node farm.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "^1.64.0"
+  },
+  "private": true
+}
