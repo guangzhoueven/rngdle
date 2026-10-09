@@ -19,15 +19,17 @@
 
 ## 使用
 
+**每台电脑首次运行**都要装一次依赖和浏览器（浏览器装在当前用户目录，拷贝项目文件不会带上它）：
+
 ```bash
-npm install
-npx playwright install chromium     # 首次需要（国内可加镜像）
-npm start
+npm install                      # 装 Node 依赖
+npx playwright install chromium  # 下载 Chromium（约 300MB，仅首次）
+npm start                        # 开始刷
 ```
 
-> Windows PowerShell 若提示「npm.ps1 / npx.ps1 因执行策略被禁止运行」，改用 `npm.cmd install`、`npx.cmd playwright install chromium`、`npm.cmd start`。
+> Windows PowerShell 若提示「npm.ps1 / npx.ps1 因执行策略被禁止运行」，把 `npm` / `npx` 换成 `npm.cmd` / `npx.cmd`。
 
-国内下载 Chromium 慢时：
+国内下载 Chromium 慢或卡在 0% 时，先设镜像再装：
 
 ```powershell
 $env:PLAYWRIGHT_DOWNLOAD_HOST="https://cdn.npmmirror.com/binaries/playwright"
@@ -77,10 +79,40 @@ Badges        : 18
 farm.js                  主程序（循环掷数 + 命中后截图/写文件）
 SCORE_PERCENTILES.json   从站点提取的 EP → 百分位表（60,392 条）
 package.json
+README.md
 output/                  运行结果
 ```
 
 判定阈值 `MYTHIC_MIN_SCORE = 162292` 写在 `farm.js` 顶部，若站点更新评分规则需重新提取。
+
+## 故障排除
+
+**1. `browserType.launch: Executable doesn't exist at ...\ms-playwright\chromium_headless_shell-1248\...`**
+
+新电脑没装浏览器，执行一次即可：
+
+```powershell
+npx.cmd playwright install chromium
+```
+
+**2. `npm.ps1 / npx.ps1 因在此系统上禁止运行脚本`**
+
+执行策略限制，改用带 `.cmd` 的写法：`npm.cmd install`、`npx.cmd playwright install chromium`、`npm.cmd start`。
+
+**3. 浏览器下载卡在 0% 或极慢**
+
+```powershell
+$env:PLAYWRIGHT_DOWNLOAD_HOST="https://cdn.npmmirror.com/binaries/playwright"
+npx.cmd playwright install chromium
+```
+
+**4. `No mythic roll within X minutes`**
+
+正常情况，1% 概率有随机性。加大 `MAX_MINUTES` 或 `WORKERS` 再跑一次即可。
+
+**5. Playwright 版本升级后报浏览器缺失**
+
+`package.json` 里 Playwright 版本变动后，浏览器版本号也会变，重新执行 `npx.cmd playwright install chromium`。
 
 ## 注意事项
 
